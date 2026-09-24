@@ -2,10 +2,7 @@ use crate::{
     shell::{CosmicSurface, MinimizedWindow, Shell, Trigger, element::CosmicMapped},
     state::{Common, State},
     utils::prelude::*,
-    wayland::handlers::{
-        pointer_constraints::activate_pointer_constraint, xdg_shell::PopupGrabData,
-        xwayland_keyboard_grab::XWaylandGrabSeatData,
-    },
+    wayland::handlers::{xdg_shell::PopupGrabData, xwayland_keyboard_grab::XWaylandGrabSeatData},
 };
 use indexmap::IndexSet;
 use smithay::{
@@ -378,11 +375,25 @@ fn update_focus_state(
             && let Some(surface) = old_target.wl_surface()
             && let Some(pointer) = seat.get_pointer()
         {
-            with_pointer_constraint(&surface, &pointer, |constraint| {
-                if let Some(constraint) = constraint {
-                    constraint.deactivate();
-                }
+            // Xwayland games can switch between related X11 surfaces while
+            // remaining in the same XWM. Keep the lock while that X11 focus
+            // domain is still eligible for the constraint.
+            let shell = state.common.shell.read();
+            let still_eligible = target.is_some_and(|new_target| {
+                new_target.has_surface(&shell, &surface)
+                    || state
+                        .common
+                        .xwayland_constraint_focus_override(new_target, &surface)
             });
+            drop(shell);
+
+            if !still_eligible {
+                with_pointer_constraint(&surface, &pointer, |constraint| {
+                    if let Some(constraint) = constraint {
+                        constraint.deactivate();
+                    }
+                });
+            }
         }
 
         if should_update_cursor
@@ -764,12 +775,7 @@ fn update_pointer_focus(state: &mut State, seat: &Seat<State>) {
         let under = State::surface_under(position, &output, &shell)
             .map(|(target, pos)| (target, pos.as_logical()));
         let constraint_target = under.as_ref().and_then(|(target, surface_location)| {
-            let surface = target.wl_surface()?.into_owned();
-            let is_focused = seat
-                .get_keyboard()
-                .and_then(|keyboard| keyboard.current_focus())
-                .is_some_and(|focus| focus.has_surface(&shell, &surface));
-            is_focused.then_some((surface, *surface_location))
+            Some((target.wl_surface()?.into_owned(), *surface_location))
         });
         drop(shell);
 
@@ -786,7 +792,7 @@ fn update_pointer_focus(state: &mut State, seat: &Seat<State>) {
         }
 
         if let Some((surface, surface_location)) = constraint_target {
-            activate_pointer_constraint(&surface, &pointer, surface_location);
+            state.maybe_activate_pointer_constraint(seat, &surface, surface_location);
         }
     }
 }

@@ -35,7 +35,10 @@ use smithay::{
     },
     desktop::space::SpaceElement,
     input::{keyboard::ModifiersState, pointer::CursorIcon, tablet::TabletSeatTrait},
-    reexports::{wayland_server::Client, x11rb::protocol::xproto::Window as X11Window},
+    reexports::{
+        wayland_server::{Client, Resource, protocol::wl_surface::WlSurface},
+        x11rb::protocol::xproto::Window as X11Window,
+    },
     utils::{
         Buffer as BufferCoords, Logical, Point, Rectangle, SERIAL_COUNTER, Serial, Size, Transform,
     },
@@ -292,6 +295,23 @@ impl XWaylandState {
 }
 
 impl Common {
+    /// X11 windows share one Xwayland input domain. A game may lock the
+    /// pointer on an override-redirect surface that cannot itself hold COSMIC
+    /// keyboard focus, so keep Xwayland surfaces eligible while this XWM owns
+    /// keyboard focus.
+    pub fn xwayland_constraint_focus_override(
+        &self,
+        focus: &KeyboardFocusTarget,
+        surface: &WlSurface,
+    ) -> bool {
+        self.xwayland_state
+            .as_ref()
+            .and_then(|xstate| Some((&xstate.client, xstate.xwm.as_ref()?)))
+            .is_some_and(|(x_client, xwm)| {
+                focus.is_xwm(xwm.id()) && surface.client().is_some_and(|client| client == *x_client)
+            })
+    }
+
     pub fn has_x_keyboard_focus(&self, xwmid: XwmId) -> bool {
         let keyboard = self
             .shell
