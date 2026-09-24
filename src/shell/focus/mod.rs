@@ -3,7 +3,10 @@ use crate::{
     state::{Common, State},
     utils::prelude::*,
     wayland::{
-        handlers::{xdg_shell::PopupGrabData, xwayland_keyboard_grab::XWaylandGrabSeatData},
+        handlers::{
+            pointer_constraints::activate_pointer_constraint, xdg_shell::PopupGrabData,
+            xwayland_keyboard_grab::XWaylandGrabSeatData,
+        },
         protocols::session_lock_layer::layer_show_on_lock,
     },
 };
@@ -791,6 +794,10 @@ fn update_pointer_focus(state: &mut State, seat: &Seat<State>) {
             .map(|(target, pos)| (target, pos.as_logical()));
         drop(shell);
 
+        let constraint_target = under.as_ref().and_then(|(target, surface_location)| {
+            Some((target.wl_surface()?.into_owned(), *surface_location))
+        });
+
         if pointer.current_focus().as_ref() != under.as_ref().map(|(target, _)| target) {
             pointer.motion(
                 state,
@@ -801,6 +808,10 @@ fn update_pointer_focus(state: &mut State, seat: &Seat<State>) {
                     time: InputTime::now(),
                 },
             );
+        }
+
+        if let Some((surface, surface_location)) = constraint_target {
+            activate_pointer_constraint(&surface, &pointer, surface_location);
         }
     }
 }
