@@ -2,7 +2,10 @@ use crate::{
     shell::{CosmicSurface, MinimizedWindow, Shell, Trigger, element::CosmicMapped},
     state::{Common, State},
     utils::prelude::*,
-    wayland::handlers::{xdg_shell::PopupGrabData, xwayland_keyboard_grab::XWaylandGrabSeatData},
+    wayland::handlers::{
+        pointer_constraints::activate_pointer_constraint, xdg_shell::PopupGrabData,
+        xwayland_keyboard_grab::XWaylandGrabSeatData,
+    },
 };
 use indexmap::IndexSet;
 use smithay::{
@@ -760,6 +763,14 @@ fn update_pointer_focus(state: &mut State, seat: &Seat<State>) {
         let shell = state.common.shell.write();
         let under = State::surface_under(position, &output, &shell)
             .map(|(target, pos)| (target, pos.as_logical()));
+        let constraint_target = under.as_ref().and_then(|(target, surface_location)| {
+            let surface = target.wl_surface()?.into_owned();
+            let is_focused = seat
+                .get_keyboard()
+                .and_then(|keyboard| keyboard.current_focus())
+                .is_some_and(|focus| focus.has_surface(&shell, &surface));
+            is_focused.then_some((surface, *surface_location))
+        });
         drop(shell);
 
         if pointer.current_focus().as_ref() != under.as_ref().map(|(target, _)| target) {
@@ -772,6 +783,10 @@ fn update_pointer_focus(state: &mut State, seat: &Seat<State>) {
                     time: InputTime::now(),
                 },
             );
+        }
+
+        if let Some((surface, surface_location)) = constraint_target {
+            activate_pointer_constraint(&surface, &pointer, surface_location);
         }
     }
 }
