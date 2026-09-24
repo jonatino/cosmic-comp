@@ -3,7 +3,7 @@
 use crate::{
     backend::render,
     config::ScreenFilter,
-    shell::{Devices, SeatExt},
+    shell::SeatExt,
     state::{BackendData, Common},
     utils::prelude::*,
     wayland::protocols::drm::WlDrmState,
@@ -19,14 +19,20 @@ use smithay::{
         },
         drm::{DrmDeviceFd, DrmNode, NodeType},
         egl::{EGLContext, EGLDevice, EGLDisplay},
-        input::{Event, InputEvent},
+        input::{
+            AbsolutePositionEvent, Event, InputBackend, InputEvent, InputTime,
+            PointerMotionEvent as BackendPointerMotionEvent, UnusedEvent,
+        },
         renderer::{
             Bind, ImportDma,
             damage::{OutputDamageTracker, RenderOutputResult},
             glow::GlowRenderer,
         },
         vulkan::{Instance, PhysicalDevice, version::Version},
-        x11::{Window, WindowBuilder, X11Backend, X11Event, X11Handle, X11Input, X11Surface},
+        x11::{
+            Window, WindowBuilder, X11Backend, X11Event, X11Handle, X11Input, X11Surface,
+            X11VirtualDevice,
+        },
     },
     desktop::layer_map_for_output,
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
@@ -36,13 +42,84 @@ use smithay::{
         wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
         wayland_server::DisplayHandle,
     },
-    utils::{DeviceFd, Transform},
-    wayland::{dmabuf::DmabufFeedbackBuilder, presentation::Refresh},
+    utils::{DeviceFd, Logical, Point, Transform},
+    wayland::{
+        dmabuf::DmabufFeedbackBuilder, presentation::Refresh,
+        relative_pointer::RelativePointerManagerState,
+    },
 };
 use std::{borrow::BorrowMut, cell::RefCell, os::unix::io::OwnedFd, time::Duration};
 use tracing::{debug, error, info, warn};
 
 use super::render::{ScreenFilterStorage, init_shaders};
+
+// Smithay's X11 backend only reports absolute pointer motion. This tiny input
+// backend lets the nested compositor feed the same device through COSMIC's real
+// relative PointerMotion path, which is what the KMS/libinput backend uses.
+#[derive(Debug)]
+struct NestedX11RelativeInput;
+
+#[derive(Debug)]
+struct NestedX11RelativeEvent {
+    time: InputTime,
+    delta: Point<f64, Logical>,
+}
+
+impl InputBackend for NestedX11RelativeInput {
+    type Device = X11VirtualDevice;
+    type KeyboardKeyEvent = UnusedEvent;
+    type PointerAxisEvent = UnusedEvent;
+    type PointerButtonEvent = UnusedEvent;
+    type PointerMotionEvent = NestedX11RelativeEvent;
+    type PointerMotionAbsoluteEvent = UnusedEvent;
+    type GestureSwipeBeginEvent = UnusedEvent;
+    type GestureSwipeUpdateEvent = UnusedEvent;
+    type GestureSwipeEndEvent = UnusedEvent;
+    type GesturePinchBeginEvent = UnusedEvent;
+    type GesturePinchUpdateEvent = UnusedEvent;
+    type GesturePinchEndEvent = UnusedEvent;
+    type GestureHoldBeginEvent = UnusedEvent;
+    type GestureHoldEndEvent = UnusedEvent;
+    type TouchDownEvent = UnusedEvent;
+    type TouchUpEvent = UnusedEvent;
+    type TouchMotionEvent = UnusedEvent;
+    type TouchCancelEvent = UnusedEvent;
+    type TouchFrameEvent = UnusedEvent;
+    type TabletToolAxisEvent = UnusedEvent;
+    type TabletToolProximityEvent = UnusedEvent;
+    type TabletToolTipEvent = UnusedEvent;
+    type TabletToolButtonEvent = UnusedEvent;
+    type SwitchToggleEvent = UnusedEvent;
+    type SpecialEvent = ();
+}
+
+impl Event<NestedX11RelativeInput> for NestedX11RelativeEvent {
+    fn time(&self) -> InputTime {
+        self.time
+    }
+
+    fn device(&self) -> X11VirtualDevice {
+        X11VirtualDevice
+    }
+}
+
+impl BackendPointerMotionEvent<NestedX11RelativeInput> for NestedX11RelativeEvent {
+    fn delta_x(&self) -> f64 {
+        self.delta.x
+    }
+
+    fn delta_y(&self) -> f64 {
+        self.delta.y
+    }
+
+    fn delta_x_unaccel(&self) -> f64 {
+        self.delta.x
+    }
+
+    fn delta_y_unaccel(&self) -> f64 {
+        self.delta.y
+    }
+}
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -387,6 +464,10 @@ pub fn init_backend(
         state.common.refresh();
     }
 
+    // Nested X11 testing needs the same relative-pointer global as the KMS
+    // backend so the inner Xwayland can exercise game-style relative input.
+    RelativePointerManagerState::new::<State>(dh);
+
     if state.common.with_xwayland {
         state.launch_xwayland(None);
     } else {
@@ -518,6 +599,8 @@ where
 
 impl State {
     pub fn process_x11_event(&mut self, event: InputEvent<X11Input>) {
+        let mut handled_as_relative = false;
+
         // here we can handle special cases for x11 inputs, like mapping them to windows
         if let InputEvent::PointerMotionAbsolute { event } = &event
             && let Some(window) = event.window()
@@ -532,16 +615,42 @@ impl State {
                 .unwrap();
 
             let device = event.device();
-            for seat in self.common.shell.read().seats.iter() {
-                let devices = seat.user_data().get::<Devices>().unwrap();
-                if devices.has_device(&device, &crate::input::InputBackendId::Normal) {
-                    seat.set_active_output(&output);
-                    break;
+            let seat = self
+                .common
+                .shell
+                .read()
+                .seats
+                .for_device(&device, &crate::input::InputBackendId::Normal)
+                .cloned();
+
+            if let Some(seat) = seat {
+                seat.set_active_output(&output);
+
+                if let Some(pointer) = seat.get_pointer() {
+                    let geometry = output.geometry();
+                    let position = geometry.loc.to_f64()
+                        + event
+                            .position_transformed(geometry.size.as_logical())
+                            .as_global();
+                    let old = pointer.current_location().as_global();
+                    let delta = (position - old).as_logical();
+                    self.process_input_event(
+                        InputEvent::<NestedX11RelativeInput>::PointerMotion {
+                            event: NestedX11RelativeEvent {
+                                time: event.time(),
+                                delta,
+                            },
+                        },
+                        crate::input::InputBackendId::Normal,
+                    );
+                    handled_as_relative = true;
                 }
             }
         };
 
-        self.process_input_event(event, crate::input::InputBackendId::Normal);
+        if !handled_as_relative {
+            self.process_input_event(event, crate::input::InputBackendId::Normal);
+        }
         // TODO actually figure out the output
         for output in self.common.shell.read().outputs() {
             self.backend.x11().schedule_render(output);
