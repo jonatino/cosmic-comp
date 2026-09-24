@@ -29,6 +29,7 @@ use crate::{
     utils::{prelude::*, quirks::workspace_overview_is_open},
     wayland::handlers::{
         image_copy_capture::{SessionHolder, cursor_capture_constraints},
+        pointer_constraints::activate_pointer_constraint,
         xwayland_keyboard_grab::XWaylandGrabSeat,
     },
 };
@@ -652,32 +653,11 @@ impl State {
                     );
                     ptr.frame(self);
 
-                    // If pointer is now in a constraint region and window is in focused, activate it
+                    // If the pointer is now in an inactive constraint region, activate it.
                     if let Some((under, surface_location)) = new_under
                         .and_then(|(target, loc)| Some((target.wl_surface()?.into_owned(), loc)))
                     {
-                        let shell = self.common.shell.read();
-                        let is_focused = seat
-                            .get_keyboard()
-                            .and_then(|k| k.current_focus())
-                            .is_some_and(|f| f.has_surface(&shell, &under));
-
-                        if is_focused {
-                            with_pointer_constraint(&under, &ptr, |constraint| match constraint {
-                                Some(constraint) if !constraint.is_active() => {
-                                    let region = match &*constraint {
-                                        PointerConstraint::Locked(locked) => locked.region(),
-                                        PointerConstraint::Confined(confined) => confined.region(),
-                                    };
-                                    let point =
-                                        (ptr.current_location() - surface_location).to_i32_floor();
-                                    if region.is_none_or(|region| region.contains(point)) {
-                                        constraint.activate();
-                                    }
-                                }
-                                _ => {}
-                            });
-                        }
+                        activate_pointer_constraint(&under, &ptr, surface_location);
                     }
 
                     let mut shell = self.common.shell.write();
