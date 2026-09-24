@@ -13,69 +13,61 @@ use smithay::{
 
 pub use smithay::wayland::pointer_constraints::{PointerConstraintRef, with_pointer_constraint};
 
+pub fn activate_pointer_constraint(
+    surface: &WlSurface,
+    pointer: &PointerHandle<State>,
+    surface_location: Point<f64, Logical>,
+) {
+    with_pointer_constraint(surface, pointer, |constraint| {
+        if let Some(constraint) = constraint
+            && !constraint.is_active()
+        {
+            let point = (pointer.current_location() - surface_location).to_i32_floor();
+            if constraint
+                .region()
+                .is_none_or(|region| region.contains(point))
+            {
+                constraint.activate();
+            }
+        }
+    });
+}
+
 impl PointerConstraintsHandler for State {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
-        let seat = self
+        let Some(seat) = self
             .common
             .shell
             .read()
             .seats
             .iter()
             .find(|s| s.get_pointer().as_ref() == Some(pointer))
-            .cloned();
-
-        let (is_under, is_focused, surface_location) = if let Some(seat) = seat {
-            seat.set_pointer_constraint_hint(None);
-            let current_output = seat.active_output();
-            let position = seat.get_pointer().unwrap().current_location().as_global();
-            let shell = self.common.shell.read();
-            let under = State::surface_under(position, &current_output, &shell);
-            let mut surface_location = None;
-
-            let is_under = if let Some((target, target_loc)) = under
-                && let Some(under_surface) = target.wl_surface()
-            {
-                if *under_surface == *surface {
-                    surface_location = Some(target_loc);
-                    true
-                } else {
-                    CosmicSurface::surface_tree_offset(surface, &under_surface).is_some_and(
-                        |offset| {
-                            surface_location = Some(target_loc - offset.to_f64().as_global());
-                            true
-                        },
-                    )
-                }
-            } else {
-                false
-            };
-
-            let is_focused = seat
-                .get_keyboard()
-                .and_then(|k| k.current_focus())
-                .is_some_and(|f| f.has_surface(&shell, surface));
-
-            (is_under, is_focused, surface_location)
-        } else {
-            (false, false, None)
+            .cloned()
+        else {
+            return;
         };
 
-        if is_focused && is_under {
-            with_pointer_constraint(surface, pointer, |constraint| {
-                if let Some(constraint) = constraint {
-                    if let Some(region) = constraint.region() {
-                        if let Some(surface_location) = surface_location
-                            && let position = pointer.current_location()
-                            && let point = (position - surface_location.as_logical()).to_i32_floor()
-                            && region.contains(point)
-                        {
-                            constraint.activate();
-                        }
-                    } else {
-                        constraint.activate();
-                    }
-                }
-            });
+        seat.set_pointer_constraint_hint(None);
+        let current_output = seat.active_output();
+        let position = seat.get_pointer().unwrap().current_location().as_global();
+        let shell = self.common.shell.read();
+        let under = State::surface_under(position, &current_output, &shell);
+
+        let surface_location = if let Some((target, target_loc)) = under
+            && let Some(under_surface) = target.wl_surface()
+        {
+            if *under_surface == *surface {
+                Some(target_loc)
+            } else {
+                CosmicSurface::surface_tree_offset(surface, &under_surface)
+                    .map(|offset| target_loc - offset.to_f64().as_global())
+            }
+        } else {
+            None
+        };
+
+        if let Some(surface_location) = surface_location {
+            activate_pointer_constraint(surface, pointer, surface_location.as_logical());
         }
     }
 
