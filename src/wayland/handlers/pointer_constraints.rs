@@ -2,7 +2,7 @@
 
 use crate::{shell::CosmicSurface, state::State, utils::prelude::*};
 use smithay::{
-    input::pointer::PointerHandle,
+    input::{Seat, pointer::PointerHandle},
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point},
     wayland::{
@@ -13,24 +13,49 @@ use smithay::{
 
 pub use smithay::wayland::pointer_constraints::{PointerConstraintRef, with_pointer_constraint};
 
-pub fn activate_pointer_constraint(
-    surface: &WlSurface,
-    pointer: &PointerHandle<State>,
-    surface_location: Point<f64, Logical>,
-) {
-    with_pointer_constraint(surface, pointer, |constraint| {
-        if let Some(constraint) = constraint
-            && !constraint.is_active()
-        {
-            let point = (pointer.current_location() - surface_location).to_i32_floor();
-            if constraint
-                .region()
-                .is_none_or(|region| region.contains(point))
-            {
-                constraint.activate();
-            }
+impl State {
+    /// Activate `surface`'s pointer constraint only when it is eligible for
+    /// keyboard focus and the pointer is inside the constraint region.
+    pub fn maybe_activate_pointer_constraint(
+        &self,
+        seat: &Seat<State>,
+        surface: &WlSurface,
+        surface_location: Point<f64, Logical>,
+    ) {
+        let Some(pointer) = seat.get_pointer() else {
+            return;
+        };
+
+        let shell = self.common.shell.read();
+        let is_focused = seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus())
+            .is_some_and(|focus| {
+                focus.has_surface(&shell, surface)
+                    || self
+                        .common
+                        .xwayland_constraint_focus_override(&focus, surface)
+            });
+        drop(shell);
+
+        if !is_focused {
+            return;
         }
-    });
+
+        with_pointer_constraint(surface, &pointer, |constraint| {
+            if let Some(constraint) = constraint
+                && !constraint.is_active()
+            {
+                let point = (pointer.current_location() - surface_location).to_i32_floor();
+                if constraint
+                    .region()
+                    .is_none_or(|region| region.contains(point))
+                {
+                    constraint.activate();
+                }
+            }
+        });
+    }
 }
 
 impl PointerConstraintsHandler for State {
@@ -67,7 +92,7 @@ impl PointerConstraintsHandler for State {
         };
 
         if let Some(surface_location) = surface_location {
-            activate_pointer_constraint(surface, pointer, surface_location.as_logical());
+            self.maybe_activate_pointer_constraint(&seat, surface, surface_location.as_logical());
         }
     }
 
